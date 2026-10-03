@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 use serde_json::Value;
+use std::{thread, time::Duration};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 
 use crate::auth::{count_authorization_rows, extract_refresh_token, get_credential_candidates};
 use crate::auth_flow::{
@@ -310,8 +314,18 @@ pub fn cmd_login_manual(
         anyhow::bail!("password is required");
     }
 
-    let device_uuid = crate::local_db::get_platform_uuid()
+    let platform_uuid = crate::local_db::get_platform_uuid()
         .context("could not read device UUID from IOPlatformUUID")?;
+
+    let sha1 = Sha1::digest(platform_uuid.as_bytes());
+    let sha256 = Sha256::digest(platform_uuid.as_bytes());
+
+    let mut combined = Vec::with_capacity(52);
+    combined.extend_from_slice(&sha1);   // 20 bytes
+    combined.extend_from_slice(&sha256); // 32 bytes
+
+    let device_uuid = STANDARD.encode(combined);
+    
     let app_version = resolve_login_app_version(app_version, installed_kakaotalk_version());
     eprintln!("Using app version {} for login headers.", app_version);
 
@@ -327,17 +341,15 @@ pub fn cmd_login_manual(
     let client = KakaoRestClient::new(base.clone())?;
 
     eprintln!("Logging in as {} ...", email);
-    let response = client.login_with_xvc(&email, &password, &device_uuid, DEVICE_NAME)?;
-    let status = response.get("status").and_then(Value::as_i64).unwrap_or(-1);
+    let mut response = client.login_with_xvc(&email, &password, &device_uuid, DEVICE_NAME)?;
+    let mut status = response.get("status").and_then(Value::as_i64).unwrap_or(-1);
 
-    // -100 = this device_uuid is not registered on the account yet. Recent KakaoTalk
-    // macOS builds removed the passcode/register_device REST endpoints (they 404), so
-    // there is no automated way to register the device from the CLI. Stop here with a
-    // clear warning instead of retrying — repeated logins from an unregistered device
-    // can get the account's sub-device login blocked (#20, #22).
+    // -100 = this device_uuid is not registered on the account yet. Run the passcode
+    // verification flow (request_passcode -> register_device), then retry the login.
     if status == DEVICE_NOT_REGISTERED {
-        print_device_not_registered_warning();
-        anyhow::bail!("login failed (status=-100, device not registered)");
+        register_new_device(&client, &email, &password, &device_uuid)?;
+        response = client.login_with_xvc(&email, &password, &device_uuid, DEVICE_NAME)?;
+        status = response.get("status").and_then(Value::as_i64).unwrap_or(-1);
     }
 
     if status != 0 {
@@ -370,23 +382,63 @@ pub fn cmd_login_manual(
     Ok(())
 }
 
-/// Explain `status=-100` (device not registered) and, critically, warn the user not to
-/// keep retrying. A passcode/device-registration REST flow once existed in other Kakao
-/// clients, but recent KakaoTalk macOS builds no longer expose it (the endpoints 404),
-/// so the CLI cannot register a new device. Repeated attempts risk an account block.
-fn print_device_not_registered_warning() {
+fn register_new_device(
+    client: &KakaoRestClient,
+    email: &str,
+    password: &str,
+    device_uuid: &str,
+) -> Result<()> {
     eprintln!();
-    eprintln!("This Mac is not registered on your KakaoTalk account, and KakaoTalk's");
-    eprintln!("current macOS builds no longer expose an endpoint to register it from a");
-    eprintln!("third-party client (the passcode/register_device routes return 404).");
-    eprintln!("openkakao-cli cannot complete this login. (#20, #22)");
-    eprintln!();
-    eprintln!("  🚨 Do NOT keep retrying. Repeated logins from an unregistered device");
-    eprintln!("     can get your account's sub-device login blocked or the account");
-    eprintln!("     restricted. This has actually happened to other users.");
-    eprintln!();
-    eprintln!("  Server login is unfixed on current KakaoTalk builds — but the CLI still");
-    eprintln!("  works without it: 'local-send'/'ax-read'/'local-chats' need no login at all.");
+    eprintln!("This Mac is not registered on your KakaoTalk account yet.");
+    eprintln!("Requesting a verification passcode from KakaoTalk ...");
+
+    let resp = client.request_passcode(email, password, device_uuid, DEVICE_NAME)?;
+    if let Some((status, message)) = response_error(&resp) {
+        anyhow::bail!("Could not request a passcode (status={status}): {message}");
+    }
+
+    eprintln!("Passcode is: {}", resp.get("passcode").and_then(Value::as_str).unwrap_or("").to_string());
+    eprintln!("Click the device registration message KakaoTalk sent to your phone, then enter the passcode within {} seconds.", resp.get("remainingSeconds").and_then(Value::as_i64).unwrap_or(-1));
+
+    loop {
+        let resp = client.register_device(email, password, device_uuid)?;
+        let status = resp.get("status").and_then(Value::as_i64).unwrap_or(-1);
+        
+        if status != -100 {
+            if status != 0 {
+                if let Some((status, message)) = response_error(&resp) {
+                    anyhow::bail!(
+                        "Could not register device (status={status}): {message}"
+                    );
+                }
+            }
+            break;
+        }
+
+        let remain = resp.get("remainingSeconds").and_then(Value::as_i64).unwrap_or(-1);
+        let interval = resp.get("nextRequestIntervalInSeconds").and_then(Value::as_u64).unwrap_or(1);
+        eprintln!("{} seconds remaining", remain);
+        thread::sleep(Duration::from_secs(interval));
+    }
+
+    eprintln!("Device registered. Completing login ...");
+    Ok(())
+}
+
+/// Return `(status, message)` when a KakaoTalk JSON reply reports a non-zero status,
+/// or `None` when `status == 0` (success).
+fn response_error(resp: &Value) -> Option<(i64, String)> {
+    let status = resp.get("status").and_then(Value::as_i64).unwrap_or(-1);
+    if status == 0 {
+        return None;
+    }
+    let message = resp
+        .get("message")
+        .or_else(|| resp.get("msg"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some((status, message))
 }
 
 fn print_manual_login_failure(status: i64, message: &str) {
